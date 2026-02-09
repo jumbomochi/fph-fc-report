@@ -159,13 +159,15 @@ def _build_accommodations(output: dict, template_info: dict) -> tuple:
     return (None, None, None)
 
 
-def map_fc_fields(output: dict, template_info: dict, s3_key: str = "") -> dict:
+def map_fc_fields(output: dict, template_info: dict, s3_key: str = "",
+                   fa_number: str | None = None) -> dict:
     """Map SageMaker output to FC form data structure.
 
     Args:
         output: Parsed SageMaker async inference JSON output.
         template_info: Result from determine_template().
         s3_key: S3 key of the original .out file.
+        fa_number: Financial assistance number looked up from inference jobs table.
 
     Returns:
         dict: FC form data ready for DynamoDB storage.
@@ -205,6 +207,7 @@ def map_fc_fields(output: dict, template_info: dict, s3_key: str = "") -> dict:
 
     return {
         "job_id": job_id,
+        "fa_number": fa_number,
         "template_id": template_info["template_id"],
         "template_name": template_info["template_name"],
 

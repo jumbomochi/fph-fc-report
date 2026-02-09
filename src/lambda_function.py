@@ -27,10 +27,12 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "FphFCFormData-dev")
+INFERENCE_JOBS_TABLE = os.environ.get("INFERENCE_JOBS_TABLE", "FphInferenceJobs-dev")
 
 s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(DYNAMODB_TABLE)
+inference_jobs_table = dynamodb.Table(INFERENCE_JOBS_TABLE)
 
 
 def _convert_floats_to_decimal(obj):
@@ -54,12 +56,22 @@ def _process_record(bucket: str, key: str) -> None:
     raw_body = response["Body"].read().decode("utf-8")
     sagemaker_output = json.loads(raw_body)
 
+    # Look up fa_number from the inference jobs table
+    fa_number = None
+    try:
+        jobs_response = inference_jobs_table.get_item(Key={"job_id": job_id})
+        fa_number = jobs_response.get("Item", {}).get("fa_number")
+        log_ctx["fa_number"] = fa_number
+        logger.info("Looked up fa_number=%(fa_number)s for job_id=%(job_id)s", log_ctx)
+    except ClientError:
+        logger.warning("Failed to look up fa_number for job_id=%(job_id)s", log_ctx, exc_info=True)
+
     template_info = determine_template(sagemaker_output)
     log_ctx["template_id"] = template_info["template_id"]
     log_ctx["template_name"] = template_info["template_name"]
     logger.info("Template determined: %(template_name)s (id=%(template_id)d)", log_ctx)
 
-    fc_form_data = map_fc_fields(sagemaker_output, template_info, s3_key=key)
+    fc_form_data = map_fc_fields(sagemaker_output, template_info, s3_key=key, fa_number=fa_number)
 
     item = _convert_floats_to_decimal(fc_form_data)
     # Remove None values (DynamoDB doesn't accept None for top-level attributes)

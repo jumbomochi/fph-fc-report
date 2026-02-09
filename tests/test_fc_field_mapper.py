@@ -325,6 +325,18 @@ class TestMetadata:
         result = map_fc_fields(output, template, s3_key="")
         assert result["job_id"] == ""
 
+    def test_fa_number_included_when_provided(self):
+        output = {"ward_breakdown": [], "dtf": 0}
+        template = _make_template_info(0)
+        result = map_fc_fields(output, template, fa_number="FA-99999")
+        assert result["fa_number"] == "FA-99999"
+
+    def test_fa_number_none_when_not_provided(self):
+        output = {"ward_breakdown": [], "dtf": 0}
+        template = _make_template_info(0)
+        result = map_fc_fields(output, template)
+        assert result["fa_number"] is None
+
     def test_flags_from_output(self):
         output = {
             "ward_breakdown": [],

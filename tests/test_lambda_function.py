@@ -12,6 +12,7 @@ os.environ["AWS_DEFAULT_REGION"] = "ap-southeast-1"
 os.environ["AWS_ACCESS_KEY_ID"] = "testing"
 os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
 os.environ["DYNAMODB_TABLE"] = "FphFCFormData-test"
+os.environ["INFERENCE_JOBS_TABLE"] = "FphInferenceJobs-test"
 
 
 def _make_s3_event(bucket: str, key: str) -> dict:
@@ -53,9 +54,10 @@ SAMPLE_OUTPUT_WARD_DAYS = {
 
 
 class TestHandler:
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_processes_out_file(self, mock_s3, mock_table):
+    def test_processes_out_file(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
@@ -63,6 +65,9 @@ class TestHandler:
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
         mock_table.put_item.return_value = {}
+        mock_jobs_table.get_item.return_value = {
+            "Item": {"job_id": "job-001", "fa_number": "FA-12345"}
+        }
 
         event = _make_s3_event("my-bucket", "output/job-001.out")
         result = handler(event, None)
@@ -73,13 +78,15 @@ class TestHandler:
 
         item = mock_table.put_item.call_args[1]["Item"]
         assert item["job_id"] == "job-001"
+        assert item["fa_number"] == "FA-12345"
         assert item["template_id"] == 2
         # Verify Decimal conversion
         assert isinstance(item["consultation_fee"], Decimal)
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_skips_non_out_files(self, mock_s3, mock_table):
+    def test_skips_non_out_files(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         event = _make_s3_event("my-bucket", "output/job-001.json")
@@ -89,9 +96,10 @@ class TestHandler:
         mock_s3.get_object.assert_not_called()
         mock_table.put_item.assert_not_called()
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_idempotency_skips_duplicate(self, mock_s3, mock_table):
+    def test_idempotency_skips_duplicate(self, mock_s3, mock_table, mock_jobs_table):
         """Duplicate S3 event should not overwrite existing DynamoDB record."""
         from botocore.exceptions import ClientError
         from src.lambda_function import handler
@@ -100,6 +108,7 @@ class TestHandler:
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
+        mock_jobs_table.get_item.return_value = {"Item": {"job_id": "job-dup"}}
         mock_table.put_item.side_effect = ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}},
             "PutItem",
@@ -110,15 +119,17 @@ class TestHandler:
         result = handler(event, None)
         assert result["statusCode"] == 200
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_conditional_write_uses_attribute_not_exists(self, mock_s3, mock_table):
+    def test_conditional_write_uses_attribute_not_exists(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
+        mock_jobs_table.get_item.return_value = {"Item": {"job_id": "x"}}
         mock_table.put_item.return_value = {}
 
         handler(_make_s3_event("b", "output/x.out"), None)
@@ -127,9 +138,10 @@ class TestHandler:
 
 
 class TestPartialBatchResilience:
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_one_failure_still_processes_others(self, mock_s3, mock_table):
+    def test_one_failure_still_processes_others(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         good_body = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
@@ -140,6 +152,7 @@ class TestPartialBatchResilience:
             return {"Body": MagicMock(read=MagicMock(return_value=good_body))}
 
         mock_s3.get_object.side_effect = side_effect
+        mock_jobs_table.get_item.return_value = {"Item": {}}
         mock_table.put_item.return_value = {}
 
         event = _make_multi_record_event([
@@ -154,9 +167,10 @@ class TestPartialBatchResilience:
         # Both good records should still have been written
         assert mock_table.put_item.call_count == 2
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_all_failures_raises_with_count(self, mock_s3, mock_table):
+    def test_all_failures_raises_with_count(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         mock_s3.get_object.side_effect = Exception("boom")
@@ -171,15 +185,17 @@ class TestPartialBatchResilience:
 
 
 class TestFloatToDecimalConversion:
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_nested_floats_converted(self, mock_s3, mock_table):
+    def test_nested_floats_converted(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
+        mock_jobs_table.get_item.return_value = {"Item": {}}
         mock_table.put_item.return_value = {}
 
         handler(_make_s3_event("b", "output/x.out"), None)
@@ -190,15 +206,17 @@ class TestFloatToDecimalConversion:
         # Nested in accommodation dict
         assert isinstance(item["accommodation_1"]["room_rate"], Decimal)
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_none_values_stripped_from_item(self, mock_s3, mock_table):
+    def test_none_values_stripped_from_item(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
+        mock_jobs_table.get_item.return_value = {"Item": {}}
         mock_table.put_item.return_value = {}
 
         handler(_make_s3_event("b", "output/x.out"), None)
@@ -210,9 +228,10 @@ class TestFloatToDecimalConversion:
 
 
 class TestMalformedInput:
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_invalid_json_raises(self, mock_s3, mock_table):
+    def test_invalid_json_raises(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         mock_s3.get_object.return_value = {
@@ -223,14 +242,16 @@ class TestMalformedInput:
         with pytest.raises(RuntimeError):
             handler(event, None)
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_empty_json_object_produces_unclassified(self, mock_s3, mock_table):
+    def test_empty_json_object_produces_unclassified(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=b"{}"))
         }
+        mock_jobs_table.get_item.return_value = {"Item": {}}
         mock_table.put_item.return_value = {}
 
         result = handler(_make_s3_event("b", "output/empty.out"), None)
@@ -240,9 +261,10 @@ class TestMalformedInput:
         assert item["template_id"] == 0
         assert item["template_name"] == "UNCLASSIFIED"
 
+    @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_empty_records_list(self, mock_s3, mock_table):
+    def test_empty_records_list(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         result = handler({"Records": []}, None)
