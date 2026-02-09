@@ -12,6 +12,8 @@ ADO Portal                SageMaker                  S3                     Lamb
    |                         |                        |-- S3 event --------->|                       |
    |                         |                        |   ObjectCreated       |                       |
    |                         |                        |                       |-- read .out from S3   |
+   |                         |                        |                       |-- lookup fa_number -->|
+   |                         |                        |                       |   (FphInferenceJobs)  |
    |                         |                        |                       |-- classify template   |
    |                         |                        |                       |-- map FC fields       |
    |                         |                        |                       |-- put_item --------->|
@@ -39,7 +41,7 @@ ADO Portal                SageMaker                  S3                     Lamb
 | Runtime | Python 3.12 |
 | Memory | 256 MB |
 | Timeout | 30 seconds |
-| Environment variable | `DYNAMODB_TABLE` (e.g. `FphFCFormData-dev`) |
+| Environment variables | `DYNAMODB_TABLE` (e.g. `FphFCFormData-dev`), `INFERENCE_JOBS_TABLE` (e.g. `FphInferenceJobs-dev`) |
 
 ### 2.2 What It Does
 
@@ -48,10 +50,11 @@ The Lambda (`src/lambda_function.py`) performs these steps for each `.out` file 
 1. **Parse the S3 event** to extract `bucket` and `key` (e.g. `output/a1b2c3d4.out`).
 2. **Skip non-`.out` files** — only processes files ending in `.out`.
 3. **Read and parse** the JSON body from S3. This is the raw SageMaker inference output.
-4. **Classify the template** via `determine_template()` — determines which of the 7 FC form layouts applies (see Section 4).
-5. **Map fields** via `map_fc_fields()` — transforms raw SageMaker fields into the structured FC form record with computed totals (see Section 3).
-6. **Write to DynamoDB** with a conditional expression `attribute_not_exists(job_id)` to ensure idempotency. Duplicate S3 events are silently skipped.
-7. **Log structured context** including `job_id`, `bucket`, `key`, and `template_id` for operational tracing.
+4. **Look up `fa_number`** from `FphInferenceJobs-{env}` using the `job_id`. If the lookup fails (table unreachable or record missing), `fa_number` defaults to `null` and processing continues.
+5. **Classify the template** via `determine_template()` — determines which of the 7 FC form layouts applies (see Section 4).
+6. **Map fields** via `map_fc_fields()` — transforms raw SageMaker fields into the structured FC form record with computed totals, including `fa_number` (see Section 3).
+7. **Write to DynamoDB** with a conditional expression `attribute_not_exists(job_id)` to ensure idempotency. Duplicate S3 events are silently skipped.
+8. **Log structured context** including `job_id`, `fa_number`, `bucket`, `key`, and `template_id` for operational tracing.
 
 ### 2.3 Error Handling
 
@@ -81,6 +84,7 @@ This is the same identifier the ADO portal uses when invoking the SageMaker asyn
 | Table name | `FphFCFormData-{env}` (e.g. `FphFCFormData-dev`) |
 | Partition key | `job_id` (String) |
 | Sort key | None |
+| GSI | `fa_number-index` — partition key: `fa_number` (String), projection: ALL |
 
 ### 3.2 Full Record Structure
 
@@ -90,6 +94,10 @@ All monetary values are stored as DynamoDB `Number` (Decimal), rounded to 2 deci
 {
   // === Primary Key ===
   "job_id": "a1b2c3d4-ef56-7890-abcd-1234567890ab",   // String (partition key)
+
+  // === Patient Identifier ===
+  "fa_number": "FA-12345",              // String | absent: looked up from FphInferenceJobs table
+                                        // Queryable via GSI "fa_number-index"
 
   // === Template Classification ===
   "template_id": 2,                    // Number: 1-7, or 0 for UNCLASSIFIED
@@ -259,13 +267,12 @@ The `template_id` field tells the frontend which FC form layout to render. Each 
 
 ## 5. Frontend Integration — Querying FC Form Data
 
-### 5.1 DynamoDB GetItem (Direct Access)
+### 5.1 DynamoDB GetItem (Direct Access by job_id)
 
 The simplest integration. The frontend (or its backend-for-frontend) queries DynamoDB directly using the `job_id` that was used when submitting the SageMaker job.
 
 ```python
 import boto3
-from boto3.dynamodb.conditions import Key
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table("FphFCFormData-dev")
@@ -278,7 +285,23 @@ if fc_data is None:
     pass
 ```
 
-### 5.2 Polling Strategy
+### 5.2 DynamoDB Query by fa_number (GSI)
+
+To look up all FC reports for a given patient/case, query the `fa_number-index` GSI:
+
+```python
+from boto3.dynamodb.conditions import Key
+
+response = table.query(
+    IndexName="fa_number-index",
+    KeyConditionExpression=Key("fa_number").eq("FA-12345"),
+)
+fc_records = response.get("Items", [])
+```
+
+This returns all FC form records associated with a given `fa_number`, which is useful when the frontend needs to list historical estimates for a patient.
+
+### 5.3 Polling Strategy
 
 Since the Lambda is event-driven (S3 trigger), there is a short delay between SageMaker writing the `.out` file and the FC record appearing in DynamoDB. Recommended polling:
 
@@ -287,7 +310,7 @@ Since the Lambda is event-driven (S3 trigger), there is a short delay between Sa
 3. If the item is not found, retry up to **5 times** with **2-second intervals**.
 4. If still not found after 10 seconds, display an error and log for investigation.
 
-### 5.3 API Gateway Integration (Optional)
+### 5.4 API Gateway Integration (Optional)
 
 If the frontend accesses data via an API Gateway, create a thin Lambda or direct DynamoDB integration:
 
@@ -407,16 +430,17 @@ The system uses environment variables for cross-environment deployment:
 
 | Variable | Lambda | Description |
 |----------|--------|-------------|
-| `DYNAMODB_TABLE` | Yes | DynamoDB table name (e.g. `FphFCFormData-dev`, `FphFCFormData-prod`) |
+| `DYNAMODB_TABLE` | Yes | FC form data table name (e.g. `FphFCFormData-dev`, `FphFCFormData-prod`) |
+| `INFERENCE_JOBS_TABLE` | Yes | Inference jobs table for `fa_number` lookup (e.g. `FphInferenceJobs-dev`) |
 | `AWS_DEFAULT_REGION` | Yes (Lambda runtime) | AWS region for boto3 clients |
 
 The S3 bucket name is **not** configured as an environment variable — it arrives dynamically via the S3 event notification payload.
 
-| Environment | S3 Bucket | DynamoDB Table |
-|-------------|-----------|----------------|
-| dev | `fph-async-inference-dev-{account_id}` | `FphFCFormData-dev` |
-| uat | `fph-async-inference-uat-{account_id}` | `FphFCFormData-uat` |
-| prod | `fph-async-inference-prod-{account_id}` | `FphFCFormData-prod` |
+| Environment | S3 Bucket | FC Form Table | Inference Jobs Table |
+|-------------|-----------|---------------|----------------------|
+| dev | `fph-async-inference-dev-{account_id}` | `FphFCFormData-dev` | `FphInferenceJobs-dev` |
+| uat | `fph-async-inference-uat-{account_id}` | `FphFCFormData-uat` | `FphInferenceJobs-uat` |
+| prod | `fph-async-inference-prod-{account_id}` | `FphFCFormData-prod` | `FphInferenceJobs-prod` |
 
 ---
 
@@ -440,13 +464,24 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
 }
 ```
 
+```json
+{
+  "Effect": "Allow",
+  "Action": ["dynamodb:GetItem"],
+  "Resource": "arn:aws:dynamodb:{region}:{account_id}:table/FphInferenceJobs-{env}"
+}
+```
+
 ### Frontend / BFF Read Access
 
 ```json
 {
   "Effect": "Allow",
-  "Action": ["dynamodb:GetItem"],
-  "Resource": "arn:aws:dynamodb:{region}:{account_id}:table/FphFCFormData-{env}"
+  "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+  "Resource": [
+    "arn:aws:dynamodb:{region}:{account_id}:table/FphFCFormData-{env}",
+    "arn:aws:dynamodb:{region}:{account_id}:table/FphFCFormData-{env}/index/fa_number-index"
+  ]
 }
 ```
 
@@ -485,8 +520,9 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
 
 **Lambda processing**:
 
-1. Template selector: ward exists (P5 Private Deluxe), no OR → `template_id=2` (Ward only, days)
-2. Field mapper produces:
+1. Looks up `fa_number` from `FphInferenceJobs-dev` using `job_id=job-xyz-123` → returns `FA-67890`
+2. Template selector: ward exists (P5 Private Deluxe), no OR → `template_id=2` (Ward only, days)
+3. Field mapper produces:
    - `accommodation_1`: P5 Private Deluxe, rate=$1,488.07, total=$5,952.28
    - `accommodation_2`: absent (None, stripped before DynamoDB write)
    - `daily_treatment_fee`: $1,332.12
@@ -501,6 +537,7 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
 ```json
 {
   "job_id": "job-xyz-123",
+  "fa_number": "FA-67890",
   "template_id": 2,
   "template_name": "Ward only (days)",
   "consultation_fee": 0,
