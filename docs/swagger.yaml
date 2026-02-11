@@ -1,0 +1,441 @@
+openapi: 3.0.3
+info:
+  title: FPH Financial Counselling Report API
+  description: |
+    API for retrieving render-ready Financial Counselling (FC) form data from
+    Farrer Park Hospital's ADO system. The response contains pre-formatted
+    monetary values and pre-built rate descriptions — the frontend renders
+    the report directly with zero processing logic.
+  version: 1.0.0
+  contact:
+    name: Farrer Park Hospital — ADO Engineering
+
+servers:
+  - url: https://{apiId}.execute-api.ap-southeast-1.amazonaws.com/{stage}
+    description: AWS API Gateway
+    variables:
+      apiId:
+        default: xxxxxxxxxx
+        description: API Gateway ID
+      stage:
+        default: dev
+        enum: [dev, uat, prod]
+
+paths:
+  /fc-report/{job_id}:
+    get:
+      summary: Get FC report by job ID
+      description: |
+        Retrieve a render-ready Financial Counselling form by the SageMaker
+        async inference job ID. The response mirrors the FC form PDF layout
+        with all values pre-formatted for direct rendering.
+      operationId: getFCReport
+      tags:
+        - FC Report
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          description: SageMaker async inference job ID (extracted from S3 key `output/{job_id}.out`)
+          schema:
+            type: string
+            example: a1b2c3d4-ef56-7890-abcd-1234567890ab
+      responses:
+        "200":
+          description: FC report found and returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FCReport"
+              example:
+                job_id: a1b2c3d4-ef56-7890-abcd-1234567890ab
+                fa_number: FA-12345
+                template_id: 2
+                template_name: Ward only (days)
+                doctors_fees:
+                  rows:
+                    - label: Consultation Fee(s)
+                      amount: "0.00"
+                    - label: Procedure / Surgeon Fee(s)
+                      amount: "0.00"
+                    - label: Assistant Surgeon Fee(s)
+                      amount: "0.00"
+                    - label: Anaesthetist Fee(s)
+                      amount: "0.00"
+                  total: "0.00"
+                  moh_benchmark: N/A
+                hospital_charges:
+                  accommodation_rows:
+                    - label: P5 Private Deluxe
+                      description: "$ 1,488.07 x 4 Day(s)"
+                      amount: "5,952.28"
+                  dtf_rows:
+                    - label: P5 Private Deluxe
+                      description: "$ 333.03 x 4 Day(s)"
+                      amount: "1,332.12"
+                  ancillary_charges: "4,480.00"
+                  daily_companion_rate: "0.00"
+                  total: "11,764.40"
+                totals:
+                  total_doctors_charges: "0.00"
+                  total_doctors_charges_moh: N/A
+                  total_hospital_charges: "11,764.40"
+                  total_estimated_amount: "11,764.40"
+                  estimated_medisave_claimable: "3,310.00"
+                  deposit_required: "8,454.40"
+                consumables_list: []
+                flags:
+                  backup_logic: false
+                  manual: false
+                  warning: false
+                  patched: false
+                raw_output_s3_key: output/a1b2c3d4-ef56-7890-abcd-1234567890ab.out
+                processed_at: "2026-02-09T08:30:00+00:00"
+        "404":
+          description: FC report not found for the given job ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: FC report not found for job_id
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: Internal server error
+
+  /fc-reports:
+    get:
+      summary: List FC reports by FA number
+      description: |
+        Query all FC reports associated with a given `fa_number` using the
+        DynamoDB GSI. Returns historical estimates for a patient/case.
+      operationId: listFCReportsByFANumber
+      tags:
+        - FC Report
+      parameters:
+        - name: fa_number
+          in: query
+          required: true
+          description: Financial assistance number to query
+          schema:
+            type: string
+            example: FA-12345
+      responses:
+        "200":
+          description: List of FC reports (may be empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FCReport"
+              example:
+                items:
+                  - job_id: a1b2c3d4-ef56-7890-abcd-1234567890ab
+                    fa_number: FA-12345
+                    template_id: 2
+                    template_name: Ward only (days)
+                    doctors_fees:
+                      rows: []
+                      total: "0.00"
+                      moh_benchmark: N/A
+                    hospital_charges:
+                      accommodation_rows: []
+                      dtf_rows: []
+                      ancillary_charges: "0.00"
+                      daily_companion_rate: "0.00"
+                      total: "0.00"
+                    totals:
+                      total_doctors_charges: "0.00"
+                      total_doctors_charges_moh: N/A
+                      total_hospital_charges: "0.00"
+                      total_estimated_amount: "0.00"
+                      estimated_medisave_claimable: "0.00"
+                      deposit_required: "0.00"
+                    consumables_list: []
+                    flags:
+                      backup_logic: false
+                      manual: false
+                      warning: false
+                      patched: false
+                    raw_output_s3_key: output/a1b2c3d4.out
+                    processed_at: "2026-02-09T08:30:00+00:00"
+        "400":
+          description: Missing required query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "fa_number query parameter is required"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: Internal server error
+
+components:
+  schemas:
+    FCReport:
+      type: object
+      required:
+        - job_id
+        - template_id
+        - template_name
+        - doctors_fees
+        - hospital_charges
+        - totals
+        - flags
+        - raw_output_s3_key
+        - processed_at
+      properties:
+        job_id:
+          type: string
+          description: SageMaker async inference job ID (partition key)
+          example: a1b2c3d4-ef56-7890-abcd-1234567890ab
+        fa_number:
+          type: string
+          nullable: true
+          description: Financial assistance number. Absent if lookup failed.
+          example: FA-12345
+        template_id:
+          type: integer
+          description: FC template scenario (1-7, or 0 for UNCLASSIFIED)
+          minimum: 0
+          maximum: 7
+          example: 2
+        template_name:
+          type: string
+          description: Human-readable template scenario name
+          example: Ward only (days)
+          enum:
+            - Ward + OR
+            - Ward only (days)
+            - Ward only (hours, 1 block)
+            - Ward only (hours, 2 blocks)
+            - Ward only (2 types)
+            - OR only (1 block)
+            - OR only (2 blocks)
+            - UNCLASSIFIED
+        doctors_fees:
+          $ref: "#/components/schemas/DoctorsFees"
+        hospital_charges:
+          $ref: "#/components/schemas/HospitalCharges"
+        totals:
+          $ref: "#/components/schemas/Totals"
+        consumables_list:
+          type: array
+          description: Detailed consumable line items (pass-through from SageMaker)
+          items:
+            $ref: "#/components/schemas/ConsumableItem"
+        flags:
+          $ref: "#/components/schemas/Flags"
+        raw_output_s3_key:
+          type: string
+          description: S3 key of the original SageMaker .out file
+          example: output/a1b2c3d4-ef56-7890-abcd-1234567890ab.out
+        processed_at:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC timestamp when the Lambda processed this record
+          example: "2026-02-09T08:30:00+00:00"
+
+    DoctorsFees:
+      type: object
+      description: "Section: Estimated Doctor(s)' Fees (Excludes GST)"
+      required:
+        - rows
+        - total
+        - moh_benchmark
+      properties:
+        rows:
+          type: array
+          description: Always 4 rows (Consultation, Procedure/Surgeon, Assistant Surgeon, Anaesthetist)
+          minItems: 4
+          maxItems: 4
+          items:
+            $ref: "#/components/schemas/FeeRow"
+        total:
+          type: string
+          description: "Total doctor's fees, formatted with commas and 2 d.p."
+          example: "350.00"
+        moh_benchmark:
+          type: string
+          description: MOH Fee Benchmark value (currently always "N/A")
+          example: N/A
+
+    FeeRow:
+      type: object
+      required:
+        - label
+        - amount
+      properties:
+        label:
+          type: string
+          description: Fee type label
+          example: Consultation Fee(s)
+        amount:
+          type: string
+          description: "Formatted monetary value (comma-separated, 2 d.p.)"
+          example: "150.00"
+
+    HospitalCharges:
+      type: object
+      description: "Section: Estimated Hospital Charges (Excludes GST)"
+      required:
+        - accommodation_rows
+        - dtf_rows
+        - ancillary_charges
+        - daily_companion_rate
+        - total
+      properties:
+        accommodation_rows:
+          type: array
+          description: "Accommodation charge rows (1-3 depending on template). Empty for template_id=0."
+          minItems: 0
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/ChargeRow"
+        dtf_rows:
+          type: array
+          description: "Daily Treatment Fee rows (1-2 depending on template). Empty for template_id=0."
+          minItems: 0
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/ChargeRow"
+        ancillary_charges:
+          type: string
+          description: "Formatted ancillary charges total"
+          example: "4,480.00"
+        daily_companion_rate:
+          type: string
+          description: "Daily companion rate (always \"0.00\" — set by ADO portal if applicable)"
+          example: "0.00"
+        total:
+          type: string
+          description: "Total estimated hospital charges"
+          example: "11,764.40"
+
+    ChargeRow:
+      type: object
+      description: A single render-ready row for accommodation or DTF sections
+      required:
+        - label
+        - description
+        - amount
+      properties:
+        label:
+          type: string
+          description: |
+            Row label (e.g., ward type, OR suite name, or "TREATMENT FEE-DAY SUITE")
+          example: P5 Private Deluxe
+        description:
+          type: string
+          description: |
+            Pre-built rate description string. Formats:
+            - Days-based: `$ 1,488.07 x 4 Day(s)`
+            - Hours/OR flat rate: `$ 165.14`
+            - Subsequent block: `$ 55.05 x 3 Hour(s)`
+          example: "$ 1,488.07 x 4 Day(s)"
+        amount:
+          type: string
+          description: "Formatted line total (comma-separated, 2 d.p.)"
+          example: "5,952.28"
+
+    Totals:
+      type: object
+      description: "Section: Total Estimated Charges (Excludes GST)"
+      required:
+        - total_doctors_charges
+        - total_doctors_charges_moh
+        - total_hospital_charges
+        - total_estimated_amount
+        - estimated_medisave_claimable
+        - deposit_required
+      properties:
+        total_doctors_charges:
+          type: string
+          description: "Total estimated doctors' charges"
+          example: "350.00"
+        total_doctors_charges_moh:
+          type: string
+          description: "MOH benchmark for doctors' charges (currently always \"N/A\")"
+          example: N/A
+        total_hospital_charges:
+          type: string
+          description: "Total estimated hospital charges"
+          example: "11,764.40"
+        total_estimated_amount:
+          type: string
+          description: "Grand total (doctors + hospital)"
+          example: "12,114.40"
+        estimated_medisave_claimable:
+          type: string
+          description: "Estimated Medisave claimable amount"
+          example: "3,310.00"
+        deposit_required:
+          type: string
+          description: "Deposit required (total - medisave)"
+          example: "8,804.40"
+
+    Flags:
+      type: object
+      description: Processing flags from SageMaker inference
+      required:
+        - backup_logic
+        - manual
+        - warning
+        - patched
+      properties:
+        backup_logic:
+          type: boolean
+          description: SageMaker used backup estimation logic
+          example: false
+        manual:
+          type: boolean
+          description: Requires manual review — do not auto-generate the report
+          example: false
+        warning:
+          type: boolean
+          description: SageMaker flagged a warning — allow generation but flag for review
+          example: false
+        patched:
+          type: boolean
+          description: SageMaker output was post-processed/patched before Lambda processing
+          example: false
+
+    ConsumableItem:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Consumable item name
+          example: Bandage
+        cost:
+          type: number
+          format: double
+          description: Item cost
+          example: 5.50
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: FC report not found for job_id
