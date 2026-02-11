@@ -40,7 +40,8 @@ def _make_multi_record_event(records: list[tuple[str, str]]) -> dict:
 SAMPLE_OUTPUT_WARD_DAYS = {
     "ward_breakdown": [
         {"ward_type": "Private", "ward_unit_cost_first_block": 806.42,
-         "ward_charges": 806.42, "ward_quantity_unit": "days"}
+         "ward_charges": 806.42, "ward_quantity_unit": "days",
+         "length_of_stay": 1, "ward_dtf_total": 333.03}
     ],
     "or_type": None,
     "or_charges": 0,
@@ -80,8 +81,12 @@ class TestHandler:
         assert item["job_id"] == "job-001"
         assert item["fa_number"] == "FA-12345"
         assert item["template_id"] == 2
-        # Verify Decimal conversion
-        assert isinstance(item["consultation_fee"], Decimal)
+        # Render-ready structure checks
+        assert item["doctors_fees"]["rows"][0]["label"] == "Consultation Fee(s)"
+        assert item["doctors_fees"]["rows"][0]["amount"] == "100.00"
+        assert item["doctors_fees"]["total"] == "350.00"
+        assert len(item["hospital_charges"]["accommodation_rows"]) == 1
+        assert item["hospital_charges"]["accommodation_rows"][0]["label"] == "Private"
 
     @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
@@ -184,14 +189,19 @@ class TestPartialBatchResilience:
             handler(event, None)
 
 
-class TestFloatToDecimalConversion:
+class TestDynamoDBSerialization:
     @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_nested_floats_converted(self, mock_s3, mock_table, mock_jobs_table):
+    def test_consumable_floats_converted_to_decimal(self, mock_s3, mock_table, mock_jobs_table):
+        """Floats in consumables_list should still be converted to Decimal."""
         from src.lambda_function import handler
 
-        body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
+        output_with_consumables = {
+            **SAMPLE_OUTPUT_WARD_DAYS,
+            "consumables_list": [{"name": "Bandage", "cost": 5.50}],
+        }
+        body_bytes = json.dumps(output_with_consumables).encode("utf-8")
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
@@ -201,30 +211,29 @@ class TestFloatToDecimalConversion:
         handler(_make_s3_event("b", "output/x.out"), None)
         item = mock_table.put_item.call_args[1]["Item"]
 
-        # Top-level float -> Decimal
-        assert isinstance(item["consultation_fee"], Decimal)
-        # Nested in accommodation dict
-        assert isinstance(item["accommodation_1"]["room_rate"], Decimal)
+        # Floats in consumables should be Decimal
+        assert isinstance(item["consumables_list"][0]["cost"], Decimal)
+        # Monetary strings should remain strings
+        assert isinstance(item["doctors_fees"]["total"], str)
 
     @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")
     @patch("src.lambda_function.s3_client")
-    def test_none_values_stripped_from_item(self, mock_s3, mock_table, mock_jobs_table):
+    def test_none_fa_number_stripped_from_item(self, mock_s3, mock_table, mock_jobs_table):
         from src.lambda_function import handler
 
         body_bytes = json.dumps(SAMPLE_OUTPUT_WARD_DAYS).encode("utf-8")
         mock_s3.get_object.return_value = {
             "Body": MagicMock(read=MagicMock(return_value=body_bytes))
         }
-        mock_jobs_table.get_item.return_value = {"Item": {}}
+        mock_jobs_table.get_item.return_value = {"Item": {}}  # no fa_number
         mock_table.put_item.return_value = {}
 
         handler(_make_s3_event("b", "output/x.out"), None)
         item = mock_table.put_item.call_args[1]["Item"]
 
-        # accommodation_2 and accommodation_3 are None and should be stripped
-        assert "accommodation_2" not in item
-        assert "accommodation_3" not in item
+        # fa_number is None when not found, and should be stripped
+        assert "fa_number" not in item
 
 
 class TestMalformedInput:
@@ -260,6 +269,8 @@ class TestMalformedInput:
         item = mock_table.put_item.call_args[1]["Item"]
         assert item["template_id"] == 0
         assert item["template_name"] == "UNCLASSIFIED"
+        assert item["hospital_charges"]["accommodation_rows"] == []
+        assert item["hospital_charges"]["dtf_rows"] == []
 
     @patch("src.lambda_function.inference_jobs_table")
     @patch("src.lambda_function.table")

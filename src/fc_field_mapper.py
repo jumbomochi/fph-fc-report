@@ -1,21 +1,22 @@
 """
-FC Field Mapper
+FC Field Mapper — Render-Ready Output
 
-Maps raw SageMaker async inference output to FC form fields using
-conditional logic defined in the FC sheet.
+Maps raw SageMaker async inference output to a render-ready FC form structure.
+The frontend can directly render the report without any processing logic.
 
-Key mapping rules:
-- Accommodation 1: ward-first, OR-fallback
-- Accommodation 2: second ward type or OR-fallback
-- Ancillary: includes doctor_prescribed_charges; adds or_charges only if ward exists
-- DTF: from ward_dtf_total or OR dtf
-- Totals: doctor's fees + hospital charges; deposit = total - medisave
+Output structure:
+- doctors_fees: rows with pre-formatted amounts, total, MOH benchmark
+- hospital_charges: accommodation_rows, dtf_rows, ancillary, companion rate, total
+- totals: all summary totals as formatted strings
 
-Rounding policy: all monetary values are rounded to 2 decimal places at the
-per-field level using banker's rounding (round half to even).
+All monetary values are formatted strings with commas and 2 decimal places
+(e.g., "5,952.28"). Rate descriptions are pre-built strings matching the
+FC form PDF layout (e.g., "$ 1,488.07 x 4 Day(s)").
 """
 
 from datetime import datetime, timezone
+
+DTF_FLAT_LABEL = "TREATMENT FEE-DAY SUITE"
 
 
 def _safe_float(val, default=0.0) -> float:
@@ -33,64 +34,190 @@ def _money(val) -> float:
     return round(_safe_float(val), 2)
 
 
-def _build_accommodation_ward(ward_entry: dict, output: dict, is_subq: bool = False) -> dict:
-    """Build accommodation slot from a ward_breakdown entry.
+def _fmt(val) -> str:
+    """Format a monetary float to comma-separated string with 2 dp."""
+    return f"{_money(val):,.2f}"
 
-    For the first block: uses ward_unit_cost_first_block and ward_type.
-    For subq blocks: appends '-PER SUBQ' to ward_type if subq cost > 0.
+
+def _build_description(rate: float, quantity=None, unit: str | None = None) -> str:
+    """Build a rate description string for accommodation/DTF rows.
+
+    - With quantity: "$ 1,488.07 x 4 Day(s)"
+    - Without quantity: "$ 165.14"
     """
-    ward_type = ward_entry.get("ward_type", "")
-    ward_unit_cost_subq = _safe_float(output.get("ward_unit_cost_subq"))
-
-    if is_subq:
-        rate = _money(ward_unit_cost_subq)
-        qty = _safe_float(output.get("ward_quantity_subq_1"))
-        return {
-            "room_type": f"{ward_type}-PER SUBQ" if ward_unit_cost_subq > 0 else ward_type,
-            "room_rate": rate,
-            "quantity": qty,
-            "total": _money(rate * qty),
-        }
-
-    return {
-        "room_type": ward_type,
-        "room_rate": _money(ward_entry.get("ward_unit_cost_first_block")),
-        "quantity": None,
-        "total": _money(ward_entry.get("ward_charges")),
-    }
+    rate_str = f"{_money(rate):,.2f}"
+    if quantity is not None and unit:
+        qty = int(quantity) if quantity == int(quantity) else quantity
+        return f"$ {rate_str} x {qty} {unit}(s)"
+    return f"$ {rate_str}"
 
 
-def _build_accommodation_or(output: dict, is_subq: bool = False) -> dict:
-    """Build accommodation slot from OR data.
+def _get_ward_quantity_unit(entry: dict) -> str | None:
+    """Get the ward quantity unit from a ward_breakdown entry."""
+    unit = entry.get("ward_quantity_unit")
+    if unit and isinstance(unit, str):
+        return unit.strip().lower() or None
+    return None
 
-    For the first block: uses or_unit_cost_first_block and or_type.
-    For subq blocks: appends '(Subsequent Hour or Part Thereof)'.
+
+def _get_length_of_stay(entry: dict) -> float:
+    """Get length of stay from a ward_breakdown entry.
+
+    Falls back to computing from ward_charges / ward_unit_cost_first_block.
     """
-    or_type = output.get("or_type", "")
-    or_unit_cost_subq = _safe_float(output.get("or_unit_cost_subq"))
+    los = _safe_float(entry.get("length_of_stay"))
+    if los > 0:
+        return los
+    rate = _safe_float(entry.get("ward_unit_cost_first_block"))
+    charges = _safe_float(entry.get("ward_charges"))
+    if rate > 0:
+        return round(charges / rate, 2)
+    return 0
 
-    if is_subq:
-        rate = _money(or_unit_cost_subq)
-        qty = _safe_float(output.get("or_quantity_subq_1"))
-        return {
-            "room_type": f"{or_type} (Subsequent Hour or Part Thereof)",
-            "room_rate": rate,
-            "quantity": qty,
-            "total": _money(rate * qty),
-        }
 
-    charging_hours = output.get("or_charging_block_hours")
-    if charging_hours:
-        room_type = f"{or_type} (First {int(charging_hours)} Hours)"
+def _build_accommodation_rows(output: dict, template_info: dict) -> list[dict]:
+    """Build render-ready accommodation rows based on template scenario.
+
+    Returns list of {"label": str, "description": str, "amount": str} dicts.
+    """
+    template_id = template_info["template_id"]
+    ward_breakdown = output.get("ward_breakdown", []) or []
+    rows = []
+
+    if template_id == 1:
+        # Ward + OR: ward accommodation + OR first block + OR subq (if exists)
+        entry = ward_breakdown[0]
+        rows.append(_accom_ward_first(entry))
+        rows.append(_accom_or_first(output))
+        if _safe_float(output.get("or_unit_cost_subq")) > 0:
+            rows.append(_accom_or_subq(output))
+
+    elif template_id == 2:
+        # Ward only (days): single ward row with rate x days
+        rows.append(_accom_ward_first(ward_breakdown[0]))
+
+    elif template_id == 3:
+        # Ward only (hours, 1 block): single ward row, flat rate
+        rows.append(_accom_ward_first(ward_breakdown[0]))
+
+    elif template_id == 4:
+        # Ward only (hours, 2 blocks): first block + subq block
+        rows.append(_accom_ward_first(ward_breakdown[0]))
+        rows.append(_accom_ward_subq(ward_breakdown[0], output))
+
+    elif template_id == 5:
+        # Ward only (2 types): one row per ward type
+        rows.append(_accom_ward_first(ward_breakdown[0]))
+        if len(ward_breakdown) > 1:
+            rows.append(_accom_ward_first(ward_breakdown[1]))
+
+    elif template_id == 6:
+        # OR only (1 block)
+        rows.append(_accom_or_first(output))
+
+    elif template_id == 7:
+        # OR only (2 blocks): first block + subq
+        rows.append(_accom_or_first(output))
+        rows.append(_accom_or_subq(output))
+
+    return rows
+
+
+def _accom_ward_first(entry: dict) -> dict:
+    """Build accommodation row for a ward first-block entry."""
+    ward_type = entry.get("ward_type", "")
+    rate = _money(entry.get("ward_unit_cost_first_block"))
+    total = _money(entry.get("ward_charges"))
+    unit = _get_ward_quantity_unit(entry)
+
+    if unit == "days":
+        los = _get_length_of_stay(entry)
+        description = _build_description(rate, los, "Day")
     else:
-        room_type = or_type
+        # Hours-based: flat rate, no multiplier
+        description = _build_description(rate)
 
-    return {
-        "room_type": room_type,
-        "room_rate": _money(output.get("or_unit_cost_first_block")),
-        "quantity": None,
-        "total": _money(output.get("or_unit_cost_first_block")),
-    }
+    return {"label": ward_type, "description": description, "amount": _fmt(total)}
+
+
+def _accom_ward_subq(entry: dict, output: dict) -> dict:
+    """Build accommodation row for a ward subsequent-block entry."""
+    ward_type = entry.get("ward_type", "")
+    ward_unit_cost_subq = _safe_float(output.get("ward_unit_cost_subq"))
+    rate = _money(ward_unit_cost_subq)
+    qty = _safe_float(output.get("ward_quantity_subq_1"))
+    total = _money(rate * qty)
+    label = f"{ward_type}-PER SUBQ" if ward_unit_cost_subq > 0 else ward_type
+    description = _build_description(rate, qty, "Hour")
+
+    return {"label": label, "description": description, "amount": _fmt(total)}
+
+
+def _accom_or_first(output: dict) -> dict:
+    """Build accommodation row for OR first-block."""
+    or_type = output.get("or_type", "")
+    charging_hours = output.get("or_charging_block_hours")
+    rate = _money(output.get("or_unit_cost_first_block"))
+
+    if charging_hours:
+        label = f"{or_type} (First {int(charging_hours)} Hours)"
+    else:
+        label = or_type
+
+    description = _build_description(rate)
+    return {"label": label, "description": description, "amount": _fmt(rate)}
+
+
+def _accom_or_subq(output: dict) -> dict:
+    """Build accommodation row for OR subsequent-block."""
+    or_type = output.get("or_type", "")
+    rate = _money(output.get("or_unit_cost_subq"))
+    qty = _safe_float(output.get("or_quantity_subq_1"))
+    total = _money(rate * qty)
+    label = f"{or_type} (Subsequent Hour or Part Thereof)"
+    description = _build_description(rate, qty, "Hour")
+
+    return {"label": label, "description": description, "amount": _fmt(total)}
+
+
+def _build_dtf_rows(output: dict, template_info: dict) -> list[dict]:
+    """Build render-ready DTF rows from ward_dtf_total and or_dtf.
+
+    Returns list of {"label": str, "description": str, "amount": str} dicts.
+    """
+    rows = []
+    ward_breakdown = output.get("ward_breakdown", []) or []
+
+    if template_info["has_ward"]:
+        for entry in ward_breakdown:
+            dtf_total = _safe_float(entry.get("ward_dtf_total"))
+            if dtf_total <= 0:
+                continue
+            unit = _get_ward_quantity_unit(entry)
+            if unit == "days":
+                los = _get_length_of_stay(entry)
+                rate = _money(dtf_total / los) if los > 0 else _money(dtf_total)
+                description = _build_description(rate, los, "Day")
+                label = entry.get("ward_type", "")
+            else:
+                description = _build_description(dtf_total)
+                label = DTF_FLAT_LABEL
+            rows.append({
+                "label": label,
+                "description": description,
+                "amount": _fmt(dtf_total),
+            })
+
+    if template_info["has_or"]:
+        or_dtf = _safe_float(output.get("or_dtf"))
+        if or_dtf > 0:
+            rows.append({
+                "label": DTF_FLAT_LABEL,
+                "description": _build_description(or_dtf),
+                "amount": _fmt(or_dtf),
+            })
+
+    return rows
 
 
 def _compute_ancillary(output: dict, has_ward: bool) -> float:
@@ -105,63 +232,9 @@ def _compute_ancillary(output: dict, has_ward: bool) -> float:
     return _money(ancillary + prescribed + or_charges)
 
 
-def _build_accommodations(output: dict, template_info: dict) -> tuple:
-    """Build accommodation slots based on template scenario.
-
-    Returns:
-        Tuple of (accommodation_1, accommodation_2, accommodation_3).
-        Unused slots are None.
-    """
-    template_id = template_info["template_id"]
-    ward_breakdown = output.get("ward_breakdown", []) or []
-
-    if template_id == 1:
-        # Ward + OR: ward accommodation + OR first block + OR subq (if exists)
-        acc1 = _build_accommodation_ward(ward_breakdown[0], output)
-        acc2 = _build_accommodation_or(output, is_subq=False)
-        or_subq_cost = _safe_float(output.get("or_unit_cost_subq"))
-        acc3 = _build_accommodation_or(output, is_subq=True) if or_subq_cost > 0 else None
-        return (acc1, acc2, acc3)
-
-    elif template_id == 2:
-        # Ward only (days): single ward line with rate x days
-        acc1 = _build_accommodation_ward(ward_breakdown[0], output)
-        return (acc1, None, None)
-
-    elif template_id == 3:
-        # Ward only (hours, 1 block): single ward line
-        acc1 = _build_accommodation_ward(ward_breakdown[0], output)
-        return (acc1, None, None)
-
-    elif template_id == 4:
-        # Ward only (hours, 2 blocks): first block + subq block
-        acc1 = _build_accommodation_ward(ward_breakdown[0], output)
-        acc2 = _build_accommodation_ward(ward_breakdown[0], output, is_subq=True)
-        return (acc1, acc2, None)
-
-    elif template_id == 5:
-        # Ward only (2 types): multiple ward types
-        acc1 = _build_accommodation_ward(ward_breakdown[0], output)
-        acc2 = _build_accommodation_ward(ward_breakdown[1], output) if len(ward_breakdown) > 1 else None
-        return (acc1, acc2, None)
-
-    elif template_id == 6:
-        # OR only (1 block)
-        acc1 = _build_accommodation_or(output, is_subq=False)
-        return (acc1, None, None)
-
-    elif template_id == 7:
-        # OR only (2 blocks): first block + subq
-        acc1 = _build_accommodation_or(output, is_subq=False)
-        acc2 = _build_accommodation_or(output, is_subq=True)
-        return (acc1, acc2, None)
-
-    return (None, None, None)
-
-
 def map_fc_fields(output: dict, template_info: dict, s3_key: str = "",
                    fa_number: str | None = None) -> dict:
-    """Map SageMaker output to FC form data structure.
+    """Map SageMaker output to render-ready FC form structure.
 
     Args:
         output: Parsed SageMaker async inference JSON output.
@@ -170,39 +243,41 @@ def map_fc_fields(output: dict, template_info: dict, s3_key: str = "",
         fa_number: Financial assistance number looked up from inference jobs table.
 
     Returns:
-        dict: FC form data ready for DynamoDB storage.
+        dict: Render-ready FC form data. All monetary values are formatted strings.
     """
-    # Doctor's fees
+    # Doctor's fees (internal floats for totals computation)
     consultation_fee = _money(output.get("consultation_fee"))
     procedure_fee = _money(output.get("procedure_fee"))
     anaesthetist_fee = _money(output.get("anaesthetist_fee"))
-    assistant_surgeon_fee = 0.0  # manual field, default 0
+    assistant_surgeon_fee = 0.0
     total_doctors_fees = _money(
         consultation_fee + procedure_fee + anaesthetist_fee + assistant_surgeon_fee
     )
 
-    # Accommodations (always returns 3-tuple)
-    accommodation_1, accommodation_2, accommodation_3 = _build_accommodations(output, template_info)
+    # Accommodation rows
+    accommodation_rows = _build_accommodation_rows(output, template_info)
 
-    # DTF
-    daily_treatment_fee = _money(output.get("dtf"))
+    # DTF rows
+    dtf_rows = _build_dtf_rows(output, template_info)
 
     # Ancillary
     ancillary_charges = _compute_ancillary(output, template_info["has_ward"])
 
     # Hospital charges total
-    accom_total = 0.0
-    for acc in [accommodation_1, accommodation_2, accommodation_3]:
-        if acc:
-            accom_total += _safe_float(acc.get("total"))
-    total_hospital_charges = _money(accom_total + daily_treatment_fee + ancillary_charges)
+    accom_total = sum(
+        _safe_float(row["amount"].replace(",", "")) for row in accommodation_rows
+    )
+    dtf_total = sum(
+        _safe_float(row["amount"].replace(",", "")) for row in dtf_rows
+    )
+    total_hospital_charges = _money(accom_total + dtf_total + ancillary_charges)
 
     # Grand totals
     total_estimated_amount = _money(total_doctors_fees + total_hospital_charges)
     estimated_medisave = _money(output.get("estimated_medisave_claimable"))
     deposit_required = _money(total_estimated_amount - estimated_medisave)
 
-    # Extract job_id from S3 key (e.g., "output/abc123.out" -> "abc123")
+    # Extract job_id from S3 key
     job_id = s3_key.rsplit("/", 1)[-1].replace(".out", "") if s3_key else ""
 
     return {
@@ -211,27 +286,33 @@ def map_fc_fields(output: dict, template_info: dict, s3_key: str = "",
         "template_id": template_info["template_id"],
         "template_name": template_info["template_name"],
 
-        # Doctor's Fees
-        "consultation_fee": consultation_fee,
-        "procedure_fee": procedure_fee,
-        "anaesthetist_fee": anaesthetist_fee,
-        "assistant_surgeon_fee": assistant_surgeon_fee,
-        "total_doctors_fees": total_doctors_fees,
+        "doctors_fees": {
+            "rows": [
+                {"label": "Consultation Fee(s)", "amount": _fmt(consultation_fee)},
+                {"label": "Procedure / Surgeon Fee(s)", "amount": _fmt(procedure_fee)},
+                {"label": "Assistant Surgeon Fee(s)", "amount": _fmt(assistant_surgeon_fee)},
+                {"label": "Anaesthetist Fee(s)", "amount": _fmt(anaesthetist_fee)},
+            ],
+            "total": _fmt(total_doctors_fees),
+            "moh_benchmark": "N/A",
+        },
 
-        # Hospital Charges - Accommodations
-        "accommodation_1": accommodation_1,
-        "accommodation_2": accommodation_2,
-        "accommodation_3": accommodation_3,
+        "hospital_charges": {
+            "accommodation_rows": accommodation_rows,
+            "dtf_rows": dtf_rows,
+            "ancillary_charges": _fmt(ancillary_charges),
+            "daily_companion_rate": "0.00",
+            "total": _fmt(total_hospital_charges),
+        },
 
-        # Hospital Charges - Other
-        "daily_treatment_fee": daily_treatment_fee,
-        "ancillary_charges": ancillary_charges,
-        "total_hospital_charges": total_hospital_charges,
-
-        # Totals
-        "total_estimated_amount": total_estimated_amount,
-        "estimated_medisave_claimable": estimated_medisave,
-        "deposit_required": deposit_required,
+        "totals": {
+            "total_doctors_charges": _fmt(total_doctors_fees),
+            "total_doctors_charges_moh": "N/A",
+            "total_hospital_charges": _fmt(total_hospital_charges),
+            "total_estimated_amount": _fmt(total_estimated_amount),
+            "estimated_medisave_claimable": _fmt(estimated_medisave),
+            "deposit_required": _fmt(deposit_required),
+        },
 
         # Metadata
         "consumables_list": output.get("consumables_list", []),

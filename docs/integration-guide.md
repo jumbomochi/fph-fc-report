@@ -86,9 +86,9 @@ This is the same identifier the ADO portal uses when invoking the SageMaker asyn
 | Sort key | None |
 | GSI | `fa_number-index` — partition key: `fa_number` (String), projection: ALL |
 
-### 3.2 Full Record Structure
+### 3.2 Full Record Structure — Render-Ready Output
 
-All monetary values are stored as DynamoDB `Number` (Decimal), rounded to 2 decimal places. Fields with `null` values at the top level are omitted from the record entirely.
+The output is **render-ready**: the frontend renders the report directly with zero processing logic. All monetary values are pre-formatted strings (comma-separated, 2 decimal places). Rate descriptions are pre-built strings matching the FC form PDF layout. Accommodation and DTF are lists of row dicts that the frontend iterates and renders.
 
 ```jsonc
 {
@@ -104,48 +104,57 @@ All monetary values are stored as DynamoDB `Number` (Decimal), rounded to 2 deci
   "template_name": "Ward only (days)", // String: human-readable scenario
 
   // === Section 1: Estimated Doctor's Fees (Excludes GST) ===
-  "consultation_fee": 150.00,          // Number
-  "procedure_fee": 500.00,             // Number
-  "anaesthetist_fee": 200.00,          // Number
-  "assistant_surgeon_fee": 0.00,       // Number (manual override, default 0)
-  "total_doctors_fees": 850.00,        // Number (sum of above four)
+  "doctors_fees": {
+    "rows": [                          // List: one entry per fee type (always 4)
+      {"label": "Consultation Fee(s)", "amount": "150.00"},
+      {"label": "Procedure / Surgeon Fee(s)", "amount": "500.00"},
+      {"label": "Assistant Surgeon Fee(s)", "amount": "0.00"},
+      {"label": "Anaesthetist Fee(s)", "amount": "200.00"}
+    ],
+    "total": "850.00",                 // String: sum of all fee amounts
+    "moh_benchmark": "N/A"             // String: MOH benchmark column value
+  },
 
   // === Section 2: Estimated Hospital Charges (Excludes GST) ===
+  "hospital_charges": {
+    // -- Accommodation Charges (1-3 rows depending on template) --
+    "accommodation_rows": [            // List of render-ready rows
+      {
+        "label": "P5 Private Deluxe",                // String: row label
+        "description": "$ 1,488.07 x 4 Day(s)",      // String: rate description
+        "amount": "5,952.28"                          // String: line total
+      },
+      {
+        "label": "Day Surgery Suite (First 3 Hours)",
+        "description": "$ 151.38",
+        "amount": "151.38"
+      }
+    ],
 
-  // -- Accommodation Charges (up to 3 rows) --
-  "accommodation_1": {                 // Map (always present for template_id 1-7)
-    "room_type": "P5 Private Deluxe",  //   String: display label for the FC form
-    "room_rate": 1488.07,              //   Number: unit cost ($ per day/hour/block)
-    "quantity": null,                  //   Number | null: subq quantity (null for first blocks)
-    "total": 5952.28                   //   Number: line total
+    // -- Daily Treatment Fees (1-2 rows depending on template) --
+    "dtf_rows": [                      // List of render-ready rows
+      {
+        "label": "P5 Private Deluxe",                // String: ward_type or "TREATMENT FEE-DAY SUITE"
+        "description": "$ 333.03 x 4 Day(s)",        // String: rate description
+        "amount": "1,332.12"                          // String: DTF total for this row
+      }
+    ],
+
+    // -- Other charges --
+    "ancillary_charges": "4,480.00",   // String: formatted ancillary total
+    "daily_companion_rate": "0.00",    // String: always "0.00" (set by ADO portal if needed)
+    "total": "11,764.40"              // String: total hospital charges
   },
-  "accommodation_2": {                 // Map | absent: present for templates 1,4,5,7
-    "room_type": "Day Surgery Suite (First 3 Hours)",
-    "room_rate": 151.38,
-    "quantity": null,
-    "total": 151.38
-  },
-  // "accommodation_3" only present for template 1 (Ward+OR) when OR has subq block
-  "accommodation_3": {                 // Map | absent
-    "room_type": "Day Surgery Suite (Subsequent Hour or Part Thereof)",
-    "room_rate": 68.81,
-    "quantity": 3,                     //   Number: subsequent hours/units
-    "total": 206.43
-  },
-
-  // -- Daily Treatment Fees --
-  "daily_treatment_fee": 1332.12,      // Number
-
-  // -- Ancillary Charges --
-  "ancillary_charges": 4480.00,        // Number
-
-  // -- Hospital Charges Total --
-  "total_hospital_charges": 12121.81,  // Number (all accommodation + DTF + ancillary)
 
   // === Section 3: Total Estimated Charges (Excludes GST) ===
-  "total_estimated_amount": 12971.81,  // Number (doctors_fees + hospital_charges)
-  "estimated_medisave_claimable": 3310.00, // Number
-  "deposit_required": 9661.81,         // Number (total - medisave)
+  "totals": {
+    "total_doctors_charges": "850.00",         // String
+    "total_doctors_charges_moh": "N/A",        // String: MOH benchmark
+    "total_hospital_charges": "11,764.40",     // String
+    "total_estimated_amount": "12,614.40",     // String: doctors + hospital
+    "estimated_medisave_claimable": "3,310.00", // String
+    "deposit_required": "9,304.40"             // String: total - medisave
+  },
 
   // === Metadata ===
   "consumables_list": [ ... ],         // List: detailed consumable line items (pass-through)
@@ -160,97 +169,47 @@ All monetary values are stored as DynamoDB `Number` (Decimal), rounded to 2 deci
 }
 ```
 
-### 3.3 Field Presence by Template
+### 3.3 Row Counts by Template
 
-| Field | T1 | T2 | T3 | T4 | T5 | T6 | T7 |
-|-------|----|----|----|----|----|----|-----|
-| `accommodation_1` | Ward row | Ward row | Ward row | Ward first-block | Ward type 1 | OR first-block | OR first-block |
-| `accommodation_2` | OR first-block | absent | absent | Ward subq-block | Ward type 2 | absent | OR subq-block |
-| `accommodation_3` | OR subq-block* | absent | absent | absent | absent | absent | absent |
+| Template | Accommodation Rows | DTF Rows |
+|----------|-------------------|----------|
+| 1 (Ward+OR) | 2-3 (ward + OR first + OR subq if exists) | 1-2 (ward DTF + OR DTF if exists) |
+| 2 (Ward days) | 1 | 1 |
+| 3 (Ward hours 1-block) | 1 | 1 |
+| 4 (Ward hours 2-blocks) | 2 | 1 |
+| 5 (Ward 2 types) | 2 | 1-2 |
+| 6 (OR 1-block) | 1 | 1 |
+| 7 (OR 2-blocks) | 2 | 1 |
+### 3.4 Rendering the Report
 
-*`accommodation_3` is only present in Template 1 when `or_unit_cost_subq > 0`.
+The output is **render-ready**. The frontend simply:
 
-### 3.4 `accommodation_*` Row Display Formatting
+1. Iterate `doctors_fees.rows` → render each `{label, amount}` as a row
+2. Render `doctors_fees.total` and `doctors_fees.moh_benchmark`
+3. Iterate `hospital_charges.accommodation_rows` → render each `{label, description, amount}`
+4. Iterate `hospital_charges.dtf_rows` → render each `{label, description, amount}`
+5. Render `hospital_charges.ancillary_charges` and `hospital_charges.daily_companion_rate`
+6. Render `hospital_charges.total`
+7. Render all fields in `totals`
 
-Each accommodation object maps to one row in the "Accommodation Charges" section of the FC form PDF:
+No template-specific conditional logic is needed — the Lambda resolves all row variations. The `template_id` field is informational only.
 
-```
-| {room_type}    | $ {room_rate} [x {quantity} Unit(s)] |  $  {total} |
-```
+### 3.5 Rate Description Formats
 
-Rules:
-- If `quantity` is `null`, display as `$ {room_rate}` without the multiplier (first-block pricing).
-- If `quantity` is set, display as `$ {room_rate} x {quantity} Hour(s)` or `Day(s)` depending on context.
-- The unit label (Day/Hour) is encoded in the `room_type` string itself (e.g. "DAY SUITE BED (4-BED)-PER SUBQ").
+The `description` field in accommodation and DTF rows uses these patterns:
+
+| Scenario | Format | Example |
+|----------|--------|---------|
+| Days-based ward | `$ {rate} x {days} Day(s)` | `$ 1,488.07 x 4 Day(s)` |
+| Hours-based first block | `$ {rate}` | `$ 123.85` |
+| OR first block | `$ {rate}` | `$ 165.14` |
+| Subsequent block (ward/OR) | `$ {rate} x {qty} Hour(s)` | `$ 55.05 x 3 Hour(s)` |
 
 ---
 
-## 4. Template Scenarios — Frontend Rendering Guide
+## 4. Template Scenarios (Reference)
 
-The `template_id` field tells the frontend which FC form layout to render. Each template corresponds to one of the 7 reference PDFs in `resources/FC Templates/`.
-
-### Template 1: Ward + OR (2 or 3 accommodation rows)
-
-**When**: Patient has both a ward stay and an operating room procedure.
-
-**Accommodation Charges section**:
-| Row | Source | Example |
-|-----|--------|---------|
-| `accommodation_1` | Ward | P5 Private Deluxe — $1,488.07 x 4 Day(s) = $5,952.28 |
-| `accommodation_2` | OR first block | Day Surgery Suite (First 3 Hours) — $151.38 |
-| `accommodation_3` | OR subsequent block (if exists) | Day Surgery Suite (Subsequent Hour or Part Thereof) — $68.81 x 3 Hour(s) = $206.43 |
-
-**Daily Treatment Fees section**: May have two DTF rows (ward DTF + OR DTF). The `daily_treatment_fee` field is the total.
-
-**Ancillary Charges**: Includes `or_charges` in the total (ward+OR scenario only).
-
-### Template 2: Ward Only — Days (1 accommodation row)
-
-**When**: Patient has a ward stay billed in days, no OR.
-
-| Row | Example |
-|-----|---------|
-| `accommodation_1` | Private — $806.42 x 1 Day(s) = $806.42 |
-
-### Template 3: Ward Only — Hours, 1 Block (1 accommodation row)
-
-**When**: Patient has a short ward stay billed in hours, single pricing block.
-
-| Row | Example |
-|-----|---------|
-| `accommodation_1` | DAY SUITE BED (4 BED)-1ST 3HR — $123.85 |
-
-### Template 4: Ward Only — Hours, 2 Blocks (2 accommodation rows)
-
-**When**: Patient has an hours-based ward stay that exceeds the first charging block.
-
-| Row | Example |
-|-----|---------|
-| `accommodation_1` | DAY SUITE BED (4 BED) — $123.85 |
-| `accommodation_2` | DAY SUITE BED (4-BED)-PER SUBQ — $55.05 x 3 Hour(s) = $165.15 |
-
-### Template 5: Ward Only — 2 Types (2 accommodation rows, potentially 2 DTF rows)
-
-**When**: Patient stayed in two different ward types (e.g. transferred from private room to day surgery suite).
-
-| Row | Example |
-|-----|---------|
-| `accommodation_1` | P5 Private Deluxe — $1,488.07 x 1 Day(s) = $1,488.07 |
-| `accommodation_2` | Day Surgery Suite (First 3 Hours) — $151.38 |
-
-**Daily Treatment Fees**: May list two DTF lines (one per ward type). The `daily_treatment_fee` field is the combined total.
-
-### Template 6: OR Only — 1 Block (1 accommodation row)
-
-**When**: Outpatient procedure, OR only, no ward stay.
-
-| Row | Example |
-|-----|---------|
-| `accommodation_1` | Cardiovascular Suite (First 4 Hours) — $165.14 |
-
-### Template 7: OR Only — 2 Blocks (2 accommodation rows)
-
-**When**: OR procedure that exceeds the first charging block.
+The `template_id` field indicates which FC form scenario was classified. Since the output is render-ready, the frontend does **not** need template-specific rendering logic. This section is for reference only.
 
 | Row | Example |
 |-----|---------|
@@ -322,7 +281,9 @@ Response 200:
   "job_id": "...",
   "template_id": 2,
   "template_name": "Ward only (days)",
-  "consultation_fee": 150.00,
+  "doctors_fees": { "rows": [...], "total": "350.00", ... },
+  "hospital_charges": { "accommodation_rows": [...], ... },
+  "totals": { ... },
   ...
 }
 
@@ -336,9 +297,9 @@ Response 404:
 
 ## 6. Rendering the FC Report
 
-### 6.1 Mapping DynamoDB Fields to FC Form Sections
+### 6.1 Render-Ready Output
 
-The FC form PDF (FORM-CR-PSC-002 R8-10/24) has these sections, mapped as follows:
+The DynamoDB record is **render-ready**. The frontend does **not** need any processing logic — it simply iterates the pre-built rows and displays the pre-formatted values. See Section 3.4 for the rendering flow.
 
 #### Admission Details (header — not from this Lambda)
 
@@ -352,59 +313,7 @@ These fields come from the original ADO portal submission, not from this Lambda'
 | Patient Name / Patient ID | ADO portal input |
 | Admitting Doctor | ADO portal input |
 | Admission Date / Time | ADO portal input |
-| Room Type | ADO portal input (or derive from `accommodation_1.room_type`) |
-
-#### Estimated Doctor's Fees (Excludes GST)
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| Consultation Fee(s) | `consultation_fee` |
-| Procedure / Surgeon Fee(s) | `procedure_fee` |
-| Assistant Surgeon Fee(s) | `assistant_surgeon_fee` |
-| Anaesthetist Fee(s) | `anaesthetist_fee` |
-| **TOTAL ESTIMATED DOCTOR(S)' FEES** | `total_doctors_fees` |
-
-Display "N/A" in the MOH Benchmark column if benchmark data is unavailable.
-
-#### Estimated Hospital Charges (Excludes GST)
-
-**Accommodation Charges**:
-
-Render one row per non-null `accommodation_*` field:
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| Row label | `accommodation_N.room_type` |
-| Rate x Quantity | `$ {accommodation_N.room_rate}` + ` x {accommodation_N.quantity} Unit(s)` if quantity is set |
-| Line total | `accommodation_N.total` |
-
-**Daily Treatment Fees**:
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| DTF line total | `daily_treatment_fee` |
-
-**Ancillary\* Charges**:
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| Ancillary total | `ancillary_charges` |
-
-**Daily Companion Rate**: Not computed by this Lambda (always $0.00 — set by the ADO portal if applicable).
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| **TOTAL ESTIMATED HOSPITAL CHARGES** | `total_hospital_charges` |
-
-#### Total Estimated Charges (Excludes GST)
-
-| FC Form Field | DynamoDB Field |
-|---------------|----------------|
-| Total Estimated Doctors' Charges | `total_doctors_fees` |
-| Total Estimated Hospital Charges | `total_hospital_charges` |
-| **Total Estimated Amount** | `total_estimated_amount` |
-| Estimated Medisave Claimable | `estimated_medisave_claimable` |
-| **Deposit Required** | `deposit_required` |
+| Room Type | ADO portal input (or derive from first `accommodation_rows[0].label`) |
 
 ### 6.2 Handling the `flags` Object
 
@@ -498,7 +407,9 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
       "ward_type": "P5 Private Deluxe",
       "ward_unit_cost_first_block": 1488.07,
       "ward_charges": 5952.28,
-      "ward_quantity_unit": "days"
+      "ward_quantity_unit": "days",
+      "length_of_stay": 4,
+      "ward_dtf_total": 1332.12
     }
   ],
   "or_type": null,
@@ -522,15 +433,12 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
 
 1. Looks up `fa_number` from `FphInferenceJobs-dev` using `job_id=job-xyz-123` → returns `FA-67890`
 2. Template selector: ward exists (P5 Private Deluxe), no OR → `template_id=2` (Ward only, days)
-3. Field mapper produces:
-   - `accommodation_1`: P5 Private Deluxe, rate=$1,488.07, total=$5,952.28
-   - `accommodation_2`: absent (None, stripped before DynamoDB write)
-   - `daily_treatment_fee`: $1,332.12
-   - `ancillary_charges`: $4,480.00 (no OR charges added since there's no ward+OR scenario — wait, actually ancillary = llm + prescribed + or_charges when ward exists, but or_charges=0 here, so $4,480.00)
-   - `total_hospital_charges`: 5,952.28 + 1,332.12 + 4,480.00 = $11,764.40
-   - `total_doctors_fees`: $0.00
-   - `total_estimated_amount`: $11,764.40
-   - `deposit_required`: 11,764.40 - 3,310.00 = $8,454.40
+3. Field mapper produces render-ready output:
+   - 1 accommodation row: P5 Private Deluxe, description "$ 1,488.07 x 4 Day(s)", amount "5,952.28"
+   - 1 DTF row: P5 Private Deluxe, description "$ 333.03 x 4 Day(s)", amount "1,332.12"
+   - ancillary_charges: "4,480.00"
+   - total_hospital_charges: "11,764.40" (5,952.28 + 1,332.12 + 4,480.00)
+   - deposit_required: "8,454.40" (11,764.40 - 3,310.00)
 
 **DynamoDB record** (key = `job-xyz-123`):
 
@@ -540,27 +448,39 @@ The S3 bucket name is **not** configured as an environment variable — it arriv
   "fa_number": "FA-67890",
   "template_id": 2,
   "template_name": "Ward only (days)",
-  "consultation_fee": 0,
-  "procedure_fee": 0,
-  "anaesthetist_fee": 0,
-  "assistant_surgeon_fee": 0,
-  "total_doctors_fees": 0,
-  "accommodation_1": {
-    "room_type": "P5 Private Deluxe",
-    "room_rate": 1488.07,
-    "quantity": null,
-    "total": 5952.28
+  "doctors_fees": {
+    "rows": [
+      {"label": "Consultation Fee(s)", "amount": "0.00"},
+      {"label": "Procedure / Surgeon Fee(s)", "amount": "0.00"},
+      {"label": "Assistant Surgeon Fee(s)", "amount": "0.00"},
+      {"label": "Anaesthetist Fee(s)", "amount": "0.00"}
+    ],
+    "total": "0.00",
+    "moh_benchmark": "N/A"
   },
-  "daily_treatment_fee": 1332.12,
-  "ancillary_charges": 4480.00,
-  "total_hospital_charges": 11764.40,
-  "total_estimated_amount": 11764.40,
-  "estimated_medisave_claimable": 3310.00,
-  "deposit_required": 8454.40,
+  "hospital_charges": {
+    "accommodation_rows": [
+      {"label": "P5 Private Deluxe", "description": "$ 1,488.07 x 4 Day(s)", "amount": "5,952.28"}
+    ],
+    "dtf_rows": [
+      {"label": "P5 Private Deluxe", "description": "$ 333.03 x 4 Day(s)", "amount": "1,332.12"}
+    ],
+    "ancillary_charges": "4,480.00",
+    "daily_companion_rate": "0.00",
+    "total": "11,764.40"
+  },
+  "totals": {
+    "total_doctors_charges": "0.00",
+    "total_doctors_charges_moh": "N/A",
+    "total_hospital_charges": "11,764.40",
+    "total_estimated_amount": "11,764.40",
+    "estimated_medisave_claimable": "3,310.00",
+    "deposit_required": "8,454.40"
+  },
   "flags": { "backup_logic": false, "manual": false, "warning": false, "patched": false },
   "raw_output_s3_key": "output/job-xyz-123.out",
   "processed_at": "2026-02-09T08:30:00+00:00"
 }
 ```
 
-**Frontend renders** the FC form matching the Template 2 PDF exactly — single accommodation row, single DTF row, ancillary, and totals summing to $11,764.40 with deposit $8,454.40.
+**Frontend renders** the FC form by iterating the pre-built rows — single accommodation row, single DTF row, ancillary, and totals summing to $11,764.40 with deposit $8,454.40. No processing logic needed.

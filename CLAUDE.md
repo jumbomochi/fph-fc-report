@@ -28,7 +28,7 @@ pip install -r requirements.txt
 
 - `src/lambda_function.py` — Lambda entry point (`handler`). Triggered by S3 `ObjectCreated` events. Reads `.out` JSON from S3, orchestrates processing, writes to DynamoDB. Uses conditional writes (`attribute_not_exists`) for idempotency. Processes each S3 record independently for partial-batch resilience.
 - `src/fc_template_selector.py` — `determine_template()` classifies SageMaker output into one of 7 FC template scenarios based on ward/OR presence, ward quantity units, and block counts. Input values are normalized (strings trimmed, numerics safely converted). Returns template metadata dict used by the field mapper.
-- `src/fc_field_mapper.py` — `map_fc_fields()` applies conditional logic to map raw SageMaker fields to the FC form structure: doctor's fees, accommodation slots (up to 3), DTF, ancillary charges, and computed totals. All monetary values rounded to 2 d.p. Template ID determines which accommodation-building path is taken.
+- `src/fc_field_mapper.py` — `map_fc_fields()` produces **render-ready** FC form output. The frontend renders the report directly with zero processing logic. Output is section-based (`doctors_fees`, `hospital_charges`, `totals`) with pre-formatted monetary strings (comma-separated, 2 d.p.) and pre-built rate description strings (e.g., `$ 1,488.07 x 4 Day(s)`). Uses `ward_dtf_total`, `length_of_stay` (per ward_breakdown entry), and `or_dtf` from SageMaker output to build DTF line items.
 
 ## 7 Template Scenarios
 
@@ -48,10 +48,12 @@ Classification precedence for ward-only: 2-types (5) > hours-2-blocks (4) > hour
 
 - **Idempotency**: DynamoDB conditional writes prevent duplicate S3 notifications from overwriting records.
 - **Ancillary charges** differ by scenario: when ward exists, includes `or_charges`; OR-only does not.
-- **Accommodation slots**: ward-first with OR-fallback. Template 1 (Ward+OR) can produce 3 accommodation slots.
-- **Rounding**: all monetary values `round(..., 2)` at the per-field level (Python built-in rounding).
+- **Render-ready output**: All monetary values are pre-formatted strings (e.g., "5,952.28"). Accommodation and DTF are lists of row dicts with `label`, `description`, `amount`. The frontend iterates and renders without conditional logic.
+- **Accommodation rows**: ward-first with OR-fallback. Template 1 (Ward+OR) can produce up to 3 rows. Days-based descriptions include multiplier (e.g., `$ 1,488.07 x 4 Day(s)`); hours/OR first-block descriptions are flat rates.
+- **DTF rows**: Built from `ward_dtf_total` (per ward_breakdown entry) and `or_dtf`. Days-based wards use ward_type as label with rate x days; hours-based and OR use "TREATMENT FEE-DAY SUITE" with flat amount.
+- **Rounding**: all monetary values `round(..., 2)` at the per-field level (Python built-in rounding), then formatted as comma-separated strings.
 - **Deposit** = total_estimated_amount - estimated_medisave_claimable.
-- Floats are converted to `Decimal` before DynamoDB writes; `None` top-level values are stripped.
+- Remaining floats (e.g., in consumables_list) converted to `Decimal` before DynamoDB writes; `None` top-level values are stripped.
 - `job_id` is extracted from the S3 key: `output/{job_id}.out`.
 - DynamoDB table name and AWS config come from environment variables (`DYNAMODB_TABLE`).
 
